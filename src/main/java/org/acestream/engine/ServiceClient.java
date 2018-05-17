@@ -88,11 +88,39 @@ public class ServiceClient {
 		}
 
 		@Override
-		public void onReady(int port) throws RemoteException {
-			Log.d(TAG, "Service callback onReady: port=" + port);
+		public void onReady(int port) {
+			int engineApiPort;
+			int httpApiPort;
+
+			try {
+				engineApiPort = mService.getEngineApiPort();
+			}
+			catch(RemoteException e) {
+				Log.w(TAG, "onReady: failed to get Engine API port: " + e.getMessage());
+				engineApiPort = 0;
+			}
+
+			try {
+				httpApiPort = mService.getHttpApiPort();
+			}
+			catch(RemoteException e) {
+				Log.w(TAG, "onReady: failed to get HTTP API port: " + e.getMessage());
+				httpApiPort = 0;
+			}
+
+			Log.d(TAG, "Service callback onReady: port=" + port + " api=" + engineApiPort + " http=" + httpApiPort);
 			boolean success = (port != -1);
 			if (success) {
-				mCallback.onConnected(mService.getEngineApiPort(), mService.getHttpApiPort());
+
+				// Ports can be 0 for old versions.
+				if(engineApiPort == 0) {
+					engineApiPort = port;
+				}
+				if(httpApiPort == 0) {
+					httpApiPort = 6878;
+				}
+
+				mCallback.onConnected(engineApiPort, httpApiPort);
 			} else {
 				mCallback.onFailed();
 			}
@@ -116,12 +144,12 @@ public class ServiceClient {
 		@Override
 		public void onServiceConnected(ComponentName name, IBinder service) {
 			Log.d(TAG, "Service connected");
-			mService = IAceStreamEngine.Stub.asInterface(service);
 			try {
+				mService = IAceStreamEngine.Stub.asInterface(service);
 				mService.registerCallback(mRemoteCallback);
                 mService.startEngine();
 			} catch (RemoteException e) {
-				Log.e(TAG, "error", e);
+				Log.e(TAG, "onServiceConnected: error", e);
 			}
 		}
 	};
@@ -259,7 +287,7 @@ public class ServiceClient {
 					try {
 						mService.unregisterCallback(mRemoteCallback);
 					} catch (RemoteException e) {
-						e.printStackTrace();
+						Log.e(TAG, "Failed to unregister", e);
 					}
 				}
 				mContext.unbindService(mConnection);
@@ -304,12 +332,21 @@ public class ServiceClient {
 	        return 0;
         }
         else {
+	    	int port;
 	        try {
-                return mService.getEngineApiPort();
+                port = mService.getEngineApiPort();
             }
             catch(RemoteException e) {
-	            return 0;
+				Log.w(TAG, "Failed to get Engine API port: " + e.getMessage());
+	            port = 0;
             }
+
+			// Can be 0 for old version, return default
+			if(port == 0) {
+				port = 62062;
+			}
+
+			return port;
         }
     }
 
@@ -319,12 +356,21 @@ public class ServiceClient {
             return 0;
         }
         else {
+        	int port;
             try {
-                return mService.getHttpApiPort();
+                port = mService.getHttpApiPort();
             }
             catch(RemoteException e) {
-                return 0;
+            	Log.w(TAG, "Failed to get HTTP API port: " + e.getMessage());
+                port = 0;
             }
+
+			// Can be 0 for old version, return default
+            if(port == 0) {
+            	port = 6878;
+			}
+
+			return port;
         }
     }
 }
