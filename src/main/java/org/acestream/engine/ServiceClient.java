@@ -2,9 +2,12 @@ package org.acestream.engine;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
 
+import org.acestream.engine.client.BuildConfig;
 import org.acestream.engine.service.v0.IAceStreamEngine;
 import org.acestream.engine.service.v0.IAceStreamEngineCallback;
+import org.acestream.engine.service.v0.IStartEngineResponse;
 
 import android.content.ComponentName;
 import android.content.Context;
@@ -13,162 +16,239 @@ import android.content.ServiceConnection;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.RemoteException;
 import android.util.Log;
 import android.util.Pair;
 
 public class ServiceClient {
 
-	private final static String TAG = "AceStream/ServiceClient";
+    private final static String TAG = "AS/ServiceClient";
 
-	private IAceStreamEngine mService = null;
-	private boolean mBound = false;
-	private final Object mBoundLock = new Object();
-	private final Context mContext;
-	private final Callback mCallback;
+    private IAceStreamEngine mService = null;
+    private boolean mBound = false;
+    private boolean mIsActive = false;
+    private boolean mStartOnBind;
+    private boolean mEnableAceCastServerOnBind = false;
+    private final String mName;
+    private final Context mContext;
+    private final Callback mCallback;
+    private final ReentrantLock mBoundLock = new ReentrantLock();
 
-	public interface Callback {
-		void onConnected(int engineApiPort, int httpApiPort);
-		void onFailed();
-		void onDisconnected();
-		void onUnpacking();
-		void onStarting();
-		void onStopped();
-		void onPlaylistUpdated();
-		void onEPGUpdated();
-		void onRestartPlayer();
-	}
+    private String mAccessToken = null;
+    private int mEngineApiPort = 0;
+    private int mHttpApiPort = 0;
 
-	@SuppressWarnings("WeakerAccess")
-    public static class EngineNotFoundException extends Exception {
+    private Handler mHandler = new Handler(Looper.getMainLooper());
+
+    public interface Callback {
+        void onConnected(IAceStreamEngine service);
+        void onFailed();
+        void onDisconnected();
+        void onUnpacking();
+        void onStarting();
+        void onStopped();
+        void onPlaylistUpdated();
+        void onEPGUpdated();
+        void onRestartPlayer();
+        void onSettingsUpdated();
     }
 
-	private IAceStreamEngineCallback mRemoteCallback = new IAceStreamEngineCallback.Stub() {
-		@Override
-		public void onUnpacking() {
-			Log.d(TAG, "Service callback onUnpacking");
-			mCallback.onUnpacking();
-		}
+    public static class ServiceMissingException extends Exception {}
 
-		@Override
-		public void onStopped() {
-			Log.d(TAG, "Service callback onStopped");
-			mCallback.onStopped();
-		}
+    private IAceStreamEngineCallback mRemoteCallback = new IAceStreamEngineCallback.Stub() {
+        @Override
+        public void onUnpacking() throws RemoteException {
+            Log.d(TAG, "Service callback onUnpacking");
+            runOnMainThread(new Runnable() {
+                @Override
+                public void run() {
+                    mCallback.onUnpacking();
+                }
+            });
+        }
 
-		@Override
-		public void onWaitForNetworkConnection() {
-			// Old method, do nothing
-			// It still exists because cannot be deleted from AIDL without breaking compatibility.
-		}
+        @Override
+        public void onStopped() throws RemoteException {
+            Log.d(TAG, "Service callback onStopped");
+            setIsActive(false);
+            runOnMainThread(new Runnable() {
+                @Override
+                public void run() {
+                    mCallback.onStopped();
+                }
+            });
+        }
 
-		@Override
-		public void onStarting() {
-			Log.d(TAG, "Service callback onStarting");
-			mCallback.onStarting();
-		}
+        @Override
+        public void onWaitForNetworkConnection() {
+            // Old method, do nothing
+            // It still exists because cannot be deleted from AIDL without breaking compatibility.
+        }
 
-		@Override
-		public void onPlaylistUpdated() {
-			Log.d(TAG, "Service callback onPlaylistUpdated");
-			mCallback.onPlaylistUpdated();
-		}
+        @Override
+        public void onStarting() throws RemoteException {
+            Log.d(TAG, "Service callback onStarting");
+            runOnMainThread(new Runnable() {
+                @Override
+                public void run() {
+                    mCallback.onStarting();
+                }
+            });
+        }
 
-		@Override
-		public void onEPGUpdated() {
-			Log.d(TAG, "Service callback onEPGUpdated");
-			mCallback.onEPGUpdated();
-		}
+        @Override
+        public void onPlaylistUpdated() throws RemoteException {
+            Log.d(TAG, "Service callback onPlaylistUpdated");
+            runOnMainThread(new Runnable() {
+                @Override
+                public void run() {
+                    mCallback.onPlaylistUpdated();
+                }
+            });
+        }
 
-		@Override
-		public void onRestartPlayer() {
-			Log.d(TAG, "Service callback onRestartPlayer");
-			mCallback.onRestartPlayer();
-		}
+        @Override
+        public void onEPGUpdated() throws RemoteException {
+            Log.d(TAG, "Service callback onEPGUpdated");
+            runOnMainThread(new Runnable() {
+                @Override
+                public void run() {
+                    mCallback.onEPGUpdated();
+                }
+            });
+        }
 
-		@Override
-		public void onReady(int port) {
-			int engineApiPort;
-			int httpApiPort;
+        @Override
+        public void onSettingsUpdated() throws RemoteException {
+            Log.d(TAG, "Service callback onSettingsUpdated");
+            runOnMainThread(new Runnable() {
+                @Override
+                public void run() {
+                    mCallback.onSettingsUpdated();
+                }
+            });
+        }
 
-			try {
-				engineApiPort = mService.getEngineApiPort();
-			}
-			catch(RemoteException e) {
-				Log.w(TAG, "onReady: failed to get Engine API port: " + e.getMessage());
-				engineApiPort = 0;
-			}
+        @Override
+        public void onRestartPlayer() throws RemoteException {
+            Log.d(TAG, "Service callback onRestartPlayer");
+            runOnMainThread(new Runnable() {
+                @Override
+                public void run() {
+                    mCallback.onRestartPlayer();
+                }
+            });
+        }
 
-			try {
-				httpApiPort = mService.getHttpApiPort();
-			}
-			catch(RemoteException e) {
-				Log.w(TAG, "onReady: failed to get HTTP API port: " + e.getMessage());
-				httpApiPort = 0;
-			}
+        @Override
+        public void onReady(int port) throws RemoteException {
+            Log.d(TAG, "Service callback onReady: port=" + port);
+            final boolean success = (port != -1);
+            setIsActive(success);
+            if (success) {
+                mAccessToken = mService.getAccessToken();
+                mEngineApiPort = mService.getEngineApiPort();
+                mHttpApiPort = mService.getHttpApiPort();
+            }
 
-			Log.d(TAG, "Service callback onReady: port=" + port + " api=" + engineApiPort + " http=" + httpApiPort);
-			boolean success = (port != -1);
-			if (success) {
+            runOnMainThread(new Runnable() {
+                @Override
+                public void run() {
+                    if (success) {
+                        mCallback.onConnected(mService);
+                    } else {
+                        mCallback.onFailed();
+                    }
+                }
+            });
+        }
+    };
 
-				// Ports can be 0 for old versions.
-				if(engineApiPort == 0) {
-					engineApiPort = port;
-				}
-				if(httpApiPort == 0) {
-					httpApiPort = 6878;
-				}
+    private final IStartEngineResponse mStartEngineCallback = new IStartEngineResponse.Stub() {
+        @Override
+        public void onResult(boolean success) throws RemoteException {
+            mAccessToken = mService.getAccessToken();
+            mEngineApiPort = mService.getEngineApiPort();
+            mHttpApiPort = mService.getHttpApiPort();
 
-				mCallback.onConnected(engineApiPort, httpApiPort);
-			} else {
-				mCallback.onFailed();
-			}
-		}
-	};
+            // hide real token from log
+            String token = null;
+            if(mAccessToken != null) {
+                token = mAccessToken.substring(0, 4);
+            }
 
-	private void notifyServiceDisconnected() {
-	    synchronized (mBoundLock) {
+            Log.d(TAG, "engine started: engineApiPort=" + mEngineApiPort + " httpApiPort=" + mHttpApiPort + " token=" + token);
+
+            mRemoteCallback.onReady(mEngineApiPort);
+        }
+    };
+
+    private ServiceConnection mConnection = new ServiceConnection() {
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            Log.d(TAG, "Service disconnected");
             mCallback.onDisconnected();
             mService = null;
             mBound = false;
         }
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            Log.d(TAG, "Service connected");
+            mService = IAceStreamEngine.Stub.asInterface(service);
+            try {
+                mService.registerCallbackExt(mRemoteCallback, true);
+                if(mStartOnBind) {
+                    mService.startEngineWithCallback(mStartEngineCallback);
+                }
+                if(mEnableAceCastServerOnBind) {
+                    mService.enableAceCastServer();
+                }
+            } catch (RemoteException e) {
+                Log.e(TAG, "error", e);
+                mCallback.onFailed();
+            }
+        }
+    };
+
+    public ServiceClient(String name, Context ctx, Callback callback) {
+        this(name, ctx, callback,true);
     }
 
-	private ServiceConnection mConnection = new ServiceConnection() {
-		@Override
-		public void onServiceDisconnected(ComponentName name) {
-			Log.d(TAG, "Service disconnected");
-            notifyServiceDisconnected();
-		}
-		@Override
-		public void onServiceConnected(ComponentName name, IBinder service) {
-			Log.d(TAG, "Service connected");
-			try {
-				mService = IAceStreamEngine.Stub.asInterface(service);
-				mService.registerCallback(mRemoteCallback);
-                mService.startEngine();
-			} catch (RemoteException e) {
-				Log.e(TAG, "onServiceConnected: error", e);
-			}
-		}
-	};
-
-	public ServiceClient(Context ctx, Callback callback) {
+    public ServiceClient(String name, Context ctx, Callback callback, boolean startOnBind) {
+        if(BuildConfig.DEBUG) {
+            Log.v(TAG, "new service client: name=" + name + " context=" + ctx);
+        }
+        mName = name;
         mContext = ctx;
         mCallback = callback;
-	}
+        mStartOnBind = startOnBind;
+    }
 
-	private static List<ResolveInfo> resolveIntent(Context ctx, Intent intent) {
-		PackageManager pm = ctx.getPackageManager();
-		List<ResolveInfo> resolveInfo = pm.queryIntentServices(intent, PackageManager.MATCH_DEFAULT_ONLY);
-		if(resolveInfo == null || resolveInfo.size() == 0) {
-			Log.d(TAG, "resolveIntent: nothing found");
-			return null;
-		}
+    public String getAccessToken() {
+        return mAccessToken;
+    }
 
-		return resolveInfo;
-	}
+    public int getEngineApiPort() {
+        return mEngineApiPort;
+    }
+
+    public int getHttpApiPort() {
+        return mHttpApiPort;
+    }
+
+    private static List<ResolveInfo> resolveIntent(Context ctx, Intent intent) {
+        PackageManager pm = ctx.getPackageManager();
+        List<ResolveInfo> resolveInfo = pm.queryIntentServices(intent, PackageManager.MATCH_DEFAULT_ONLY);
+        if(resolveInfo == null || resolveInfo.size() == 0) {
+            Log.d(TAG, "resolveIntent: nothing found");
+            return null;
+        }
+
+        return resolveInfo;
+    }
 
     /**
      * Select which Ace Stream application to connect to.
@@ -176,201 +256,193 @@ public class ServiceClient {
      * If several Ace Stream apps are installed then select one with highest version code.
      *
      * @param ctx Any valid Context (used to resolve intents)
-     * @return Selected application ID or null.
+     * @return Selected application ID. If no installed app is found then ServiceMissingException is thrown
      */
-	private static String getServicePackage(Context ctx) {
-		String selectedPackage = null;
-		int maxVersion = -1;
+    public static String getServicePackage(Context ctx) throws ServiceMissingException {
+        String selectedPackage = null;
+        int maxVersion = -1;
 
-		// Place all found Ace Streams apps here with version codes
-		List<Pair<String,Integer>> packages = new ArrayList<>();
+        // Place all found Ace Streams apps here with version codes
+        List<Pair<String,Integer>> packages = new ArrayList<>();
 
-		// First, find well-known apps
-		List<String> knownPackages = new ArrayList<String>(){
-			{
-				add("org.acestream.media");
-				add("org.acestream.media.atv");
-				add("org.acestream.core");
-				add("org.acestream.core.atv");
-			}
-		};
-		for(String packageName: knownPackages) {
-			int version = getAppVersion(ctx, packageName);
-			if(version != -1) {
-				Log.v(TAG, "getServicePackage: found known: id=" + packageName + " version=" + version);
-				packages.add(new Pair<>(packageName, version));
-				if(version > maxVersion) {
-					maxVersion = version;
-				}
-			}
-		}
+        // First, find well-known apps
+        List<String> knownPackages = new ArrayList<String>(){
+            {
+                add("org.acestream.media");
+                add("org.acestream.media.atv");
+                add("org.acestream.core");
+                add("org.acestream.core.atv");
+            }
+        };
+        for(String packageName: knownPackages) {
+            int version = getAppVersion(ctx, packageName);
+            if(version != -1) {
+                packages.add(new Pair<>(packageName, version));
+                if(version > maxVersion) {
+                    maxVersion = version;
+                }
+            }
+        }
 
-		// Second, find apps by implicit service intent.
+        // Second, find apps by implicit service intent.
         // Only apps starting from version 3.1.30.1 (code 301301000) can be found with intent.
-		Intent intent = new Intent("org.acestream.engine.service.v0.IAceStreamEngine");
-		List<ResolveInfo> services = resolveIntent(ctx, intent);
-		if(services != null) {
-			for (ResolveInfo ri : services) {
-				int version = getAppVersion(ctx, ri.serviceInfo.packageName);
-				if(version != -1) {
-					if(!knownPackages.contains(ri.serviceInfo.packageName)) {
-						Log.v(TAG, "getServicePackage: found by service: id=" + ri.serviceInfo.packageName + " version=" + version);
-						packages.add(new Pair<>(ri.serviceInfo.packageName, version));
-						if (version > maxVersion) {
-							maxVersion = version;
-						}
-					}
-				}
-			}
-		}
-
-		// Select package with the max version
-		for(Pair<String,Integer> item: packages) {
-			if(item.second == maxVersion) {
-				selectedPackage = item.first;
-				break;
-			}
-		}
-
-		Log.v(TAG, "getServicePackage: selected: id=" + selectedPackage);
-
-		return selectedPackage;
-	}
-
-	private static int getAppVersion(Context ctx, String packageName) {
-		int versionCode = -1;
-		try {
-			PackageInfo pkgInfo = ctx.getPackageManager().getPackageInfo(packageName, 0);
-			versionCode = pkgInfo.versionCode;
-		} catch (PackageManager.NameNotFoundException e) {
-			Log.v(TAG, "Failed to get package version: " + e.getMessage());
-		}
-		return versionCode;
-	}
-
-	private static Intent getServiceIntent(Context ctx) throws EngineNotFoundException {
-		Intent intent = new Intent(org.acestream.engine.service.v0.IAceStreamEngine.class.getName());
-		String servicePackage = getServicePackage(ctx);
-		if(servicePackage == null) {
-		    throw new EngineNotFoundException();
-        }
-		intent.setPackage(servicePackage);
-
-		return intent;
-	}
-
-	private boolean bind() throws EngineNotFoundException {
-		Log.d(TAG, "Service bind");
-		synchronized (mBoundLock) {
-			if (!mBound) {
-				if(mContext.bindService(getServiceIntent(mContext), mConnection, Context.BIND_AUTO_CREATE)) {
-                    Log.d(TAG, "Service bind done");
-                    mBound = true;
+        Intent intent = new Intent("org.acestream.engine.service.v0.IAceStreamEngine");
+        List<ResolveInfo> services = resolveIntent(ctx, intent);
+        if(services != null) {
+            for (ResolveInfo ri : services) {
+                int version = getAppVersion(ctx, ri.serviceInfo.packageName);
+                if(version != -1) {
+                    if(!knownPackages.contains(ri.serviceInfo.packageName)) {
+                        packages.add(new Pair<>(ri.serviceInfo.packageName, version));
+                        if (version > maxVersion) {
+                            maxVersion = version;
+                        }
+                    }
                 }
-                else {
-                    Log.d(TAG, "Service bind failed");
-                    mBound = false;
-                }
-			} else {
-				Log.d(TAG, "Already bound");
-			}
-			return mBound;
-		}
-	}
-
-    @SuppressWarnings("unused")
-	public void disconnect() {
-		Log.d(TAG, "Service unbind");
-		synchronized (mBoundLock) {
-			if (mBound) {
-				if (mService != null) {
-					try {
-						mService.unregisterCallback(mRemoteCallback);
-					} catch (RemoteException e) {
-						Log.e(TAG, "Failed to unregister", e);
-					}
-				}
-				mContext.unbindService(mConnection);
-                notifyServiceDisconnected();
-			} else {
-				Log.d(TAG, "Already unbound");
-			}
-		}
-	}
-
-	@SuppressWarnings("unused")
-	public boolean startEngine() throws EngineNotFoundException {
-		Log.v(TAG, "startEngine: bound=" + mBound + " service=" + mService);
-		if(mService != null) {
-			try {
-				mService.startEngine();
-			}
-			catch(RemoteException e) {
-				Log.e(TAG, "Failed to start engine", e);
-				return false;
-			}
-		}
-		else {
-			if(!mBound) {
-				return bind();
-			}
-		}
-
-		return true;
-	}
-
-	@SuppressWarnings("unused")
-	public boolean isBound() {
-		synchronized (mBoundLock) {
-			return mBound;
-		}
-	}
-
-    @SuppressWarnings("unused")
-	public int getEngineApiPort() {
-	    if(mService == null) {
-	        return 0;
+            }
         }
-        else {
-	    	int port;
-	        try {
-                port = mService.getEngineApiPort();
-            }
-            catch(RemoteException e) {
-				Log.w(TAG, "Failed to get Engine API port: " + e.getMessage());
-	            port = 0;
-            }
 
-			// Can be 0 for old version, return default
-			if(port == 0) {
-				port = 62062;
-			}
+        // Select package with the max version
+        for(Pair<String,Integer> item: packages) {
+            if(item.second == maxVersion) {
+                selectedPackage = item.first;
+                break;
+            }
+        }
 
-			return port;
+        if(BuildConfig.DEBUG) {
+            Log.v(TAG, "getServicePackage: selected: id=" + selectedPackage);
+        }
+
+        if(selectedPackage == null) {
+            Log.e(TAG, "AceStream is not installed");
+            throw new ServiceMissingException();
+        }
+
+        return selectedPackage;
+    }
+
+    private static int getAppVersion(Context ctx, String packageName) {
+        int versionCode;
+        try {
+            PackageInfo pkgInfo = ctx.getPackageManager().getPackageInfo(packageName, 0);
+            versionCode = pkgInfo.versionCode;
+        } catch (PackageManager.NameNotFoundException e) {
+            versionCode = -1;
+        }
+        return versionCode;
+    }
+
+    public static Intent getServiceIntent(Context ctx) throws ServiceMissingException {
+        Intent intent = new Intent(org.acestream.engine.service.v0.IAceStreamEngine.class.getName());
+        String servicePackage = getServicePackage(ctx);
+        intent.setPackage(servicePackage);
+
+        return intent;
+    }
+
+    public void bind() throws ServiceMissingException {
+        Log.d(TAG, "Service bind: name=" + mName + " class=" + org.acestream.engine.service.v0.IAceStreamEngine.class.getName());
+        mBoundLock.lock();
+        try {
+            if (!mBound) {
+                mBound = mContext.bindService(getServiceIntent(mContext), mConnection, Context.BIND_AUTO_CREATE);
+                Log.d(TAG, "Service bind done: bound=" + mBound);
+            } else {
+                Log.d(TAG, "Already bound");
+            }
+        }
+        finally {
+            mBoundLock.unlock();
         }
     }
 
-    @SuppressWarnings("unused")
-    public int getHttpApiPort() {
-        if(mService == null) {
-            return 0;
+    public void unbind() {
+        Log.d(TAG, "Service unbind: name=" + mName);
+        mBoundLock.lock();
+        try {
+            if (mBound) {
+                if (mService != null) {
+                    try {
+                        mService.unregisterCallback(mRemoteCallback);
+                    } catch (RemoteException e) {
+                        e.printStackTrace();
+                    }
+                }
+                mContext.unbindService(mConnection);
+                mBound = false;
+            } else {
+                Log.d(TAG, "Already unbound");
+            }
+        }
+        finally {
+            mBoundLock.unlock();
+        }
+    }
+
+    public void startEngine() throws ServiceMissingException {
+        if(mService != null) {
+            try {
+                mService.startEngineWithCallback(mStartEngineCallback);
+            }
+            catch(Throwable e) {
+                Log.e(TAG, "Failed to start engine", e);
+                mCallback.onFailed();
+            }
         }
         else {
-        	int port;
+            mStartOnBind = true;
+            if(!mBound) {
+                bind();
+            }
+        }
+    }
+
+    public void enableAceCastServer() throws ServiceMissingException {
+        Log.v(TAG, "enableAceCastServer: bound=" + mBound + " service=" + mService + " name=" + mName);
+        if(mService != null) {
             try {
-                port = mService.getHttpApiPort();
+                mService.enableAceCastServer();
             }
-            catch(RemoteException e) {
-            	Log.w(TAG, "Failed to get HTTP API port: " + e.getMessage());
-                port = 0;
+            catch(Throwable e) {
+                Log.e(TAG, "Failed to enable AceCast server", e);
             }
+        }
+        else {
+            mEnableAceCastServerOnBind = true;
+            if(!mBound) {
+                bind();
+            }
+        }
+    }
 
-			// Can be 0 for old version, return default
-            if(port == 0) {
-            	port = 6878;
-			}
+    synchronized void setIsActive(boolean active) {
+        // if already active we won't make unactive
+        if (!mIsActive) {
+            mIsActive = active;
+        }
+    }
 
-			return port;
+    public synchronized boolean isActive() {
+        return mIsActive;
+    }
+
+    public synchronized boolean isBound() {
+        mBoundLock.lock();
+        try {
+            return mBound;
+        }
+        finally {
+            mBoundLock.unlock();
+        }
+    }
+
+    private void runOnMainThread(Runnable runnable) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            runnable.run();
+        }
+        else {
+            mHandler.post(runnable);
         }
     }
 }
