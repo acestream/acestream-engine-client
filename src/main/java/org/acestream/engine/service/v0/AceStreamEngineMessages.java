@@ -48,4 +48,5 @@ public final class AceStreamEngineMessages {
     public static final int MSG_EPG_UPDATED = 9;
     public static final int MSG_RESTART_PLAYER = 10;
     public static final int MSG_SETTINGS_UPDATED = 11;
+    public static final int MSG_AUTH_UPDATED = 12;
 }

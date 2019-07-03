@@ -54,6 +54,7 @@ public class ServiceClient {
         void onEPGUpdated();
         void onRestartPlayer();
         void onSettingsUpdated();
+        void onAuthUpdated();
     }
 
     public static class ServiceMissingException extends Exception {}
@@ -117,6 +118,17 @@ public class ServiceClient {
                 @Override
                 public void run() {
                     mCallback.onEPGUpdated();
+                }
+            });
+        }
+
+        @Override
+        public void onAuthUpdated() throws RemoteException {
+            Log.d(TAG, "Service callback onAuthUpdated");
+            runOnMainThread(new Runnable() {
+                @Override
+                public void run() {
+                    mCallback.onAuthUpdated();
                 }
             });
         }

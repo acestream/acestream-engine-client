@@ -50,4 +50,9 @@ oneway interface IAceStreamEngineCallback {
      * Engine settings were updated.
      */
     void onSettingsUpdated();
+
+    /**
+     * Auth level updated.
+     */
+    void onAuthUpdated();
 }
